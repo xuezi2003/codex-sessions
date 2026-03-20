@@ -308,6 +308,31 @@ def fit_cell(text: str, width: int) -> str:
     return "".join(parts) + ellipsis + (" " * (width - used_width - ellipsis_width))
 
 
+def sanitize_screen_text(text: str) -> str:
+    sanitized: list[str] = []
+    for char in text.replace("\r", "\n").replace("\t", "    "):
+        if char == "\n" or char.isprintable():
+            sanitized.append(char)
+    return "".join(sanitized)
+
+
+def build_detail_lines(text: str, width: int) -> list[str]:
+    wrap_width = max(1, width)
+    lines: list[str] = []
+    for raw_line in sanitize_screen_text(text).split("\n"):
+        if not raw_line:
+            lines.append("")
+            continue
+        wrapped = textwrap.wrap(
+            raw_line,
+            width=wrap_width,
+            replace_whitespace=False,
+            drop_whitespace=False,
+        )
+        lines.extend(wrapped or [""])
+    return lines
+
+
 def compute_table_widths(total_width: int, separator_width: int) -> tuple[int, int, int, int]:
     available = max(4, total_width - separator_width * 3)
     minimums = [16, 18, 8, 12]
@@ -543,17 +568,11 @@ class SessionBrowser:
             conversation = []
             lines.append(f"[读取失败] {exc}")
         width = shutil.get_terminal_size((120, 30)).columns
-        wrap_width = max(20, width - 8)
+        wrap_width = max(1, width - 2)
         for role, text in conversation:
             label = ROLE_LABELS.get(role, role)
             lines.append(f"[{label}]")
-            wrapped = textwrap.wrap(
-                text,
-                width=wrap_width,
-                replace_whitespace=False,
-                drop_whitespace=False,
-            )
-            lines.extend(wrapped or [""])
+            lines.extend(build_detail_lines(text, wrap_width))
             lines.append("")
         if not conversation:
             lines.append("[没有可显示的 user/assistant 对话]")
@@ -651,11 +670,12 @@ class SessionBrowser:
                 x += len(separator)
 
     def draw_detail(self, stdscr: curses.window, height: int, width: int) -> None:
-        stdscr.addnstr(
+        self.safe_addnstr(
             0,
             0,
             "Session Detail  ↑↓/j k 滚动  e 恢复  q 返回",
-            width - 1,
+            max(1, width - 1),
+            stdscr,
             curses.A_BOLD,
         )
         visible_rows = max(1, height - 2)
@@ -665,7 +685,30 @@ class SessionBrowser:
             line_index = self.detail_offset + row_index
             if line_index >= len(self.detail_lines):
                 break
-            stdscr.addnstr(1 + row_index, 0, self.detail_lines[line_index], width - 1)
+            self.safe_addnstr(
+                1 + row_index,
+                0,
+                self.detail_lines[line_index],
+                max(1, width - 1),
+                stdscr,
+            )
+
+    def safe_addnstr(
+        self,
+        y: int,
+        x: int,
+        text: str,
+        max_width: int,
+        stdscr: curses.window,
+        attr: int = curses.A_NORMAL,
+    ) -> None:
+        if max_width <= 0:
+            return
+        clipped = fit_cell(sanitize_screen_text(text).split("\n", 1)[0], max_width)
+        try:
+            stdscr.addnstr(y, x, clipped, max_width, attr)
+        except curses.error:
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
