@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""Browse local Codex sessions without resume picker filters."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import textwrap
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Iterable
+
+
+ROLE_LABELS = {
+    "user": "用户",
+    "assistant": "助手",
+}
+
+BEIJING_TZ = timezone(timedelta(hours=8))
+TIME_PAIR_ID = 1
+ID_PAIR_ID = 2
+TITLE_PAIR_ID = 3
+LAST_PAIR_ID = 4
+
+
+@dataclass
+class SessionRecord:
+    session_id: str
+    title: str
+    updated_at: int
+    created_at: int
+    rollout_path: Path
+    cwd: str
+    model_provider: str
+    archived: bool = False
+    last_role: str = ""
+    last_text: str = ""
+
+    @property
+    def last_preview(self) -> str:
+        prefix = ""
+        if self.last_role == "user":
+            prefix = "U: "
+        elif self.last_role == "assistant":
+            prefix = "A: "
+        return prefix + self.last_text
+
+
+def decode_text(content: list[dict]) -> str:
+    parts: list[str] = []
+    for item in content:
+        text = item.get("text")
+        if text:
+            parts.append(text)
+    return "".join(parts).strip()
+
+
+def sanitize_inline(text: str) -> str:
+    return " ".join(text.replace("\r", "\n").split())
+
+
+def normalize_message_text(text: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return ""
+    if stripped.startswith("# AGENTS.md instructions for "):
+        return ""
+    if stripped.startswith("<turn_aborted>"):
+        return ""
+    return stripped
+
+
+def parse_iso_timestamp(value: str | None) -> int:
+    if not value:
+        return 0
+    try:
+        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def discover_sqlite_path(codex_home: Path, stem: str) -> Path | None:
+    candidates = []
+    for path in codex_home.glob(f"{stem}_*.sqlite"):
+        suffix = path.stem.split("_")[-1]
+        try:
+            index = int(suffix)
+        except ValueError:
+            continue
+        candidates.append((index, path))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
+
+
+def iter_rollout_files(codex_home: Path) -> Iterable[tuple[Path, bool]]:
+    for dirname, archived in (("sessions", False), ("archived_sessions", True)):
+        root = codex_home / dirname
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.jsonl")):
+            yield path, archived
+
+
+def load_sessions_from_db(db_path: Path) -> dict[str, SessionRecord]:
+    records: dict[str, SessionRecord] = {}
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                id,
+                title,
+                updated_at,
+                created_at,
+                rollout_path,
+                cwd,
+                model_provider,
+                archived
+            FROM threads
+            ORDER BY updated_at DESC, id DESC
+            """
+        )
+        for row in cur.fetchall():
+            path = row["rollout_path"]
+            if not path:
+                continue
+            record = SessionRecord(
+                session_id=row["id"],
+                title=(row["title"] or "").strip() or row["id"],
+                updated_at=int(row["updated_at"] or 0),
+                created_at=int(row["created_at"] or 0),
+                rollout_path=Path(path),
+                cwd=(row["cwd"] or "").strip(),
+                model_provider=(row["model_provider"] or "").strip(),
+                archived=bool(row["archived"]),
+            )
+            records[record.session_id] = record
+    finally:
+        conn.close()
+    return records
+
+
+def merge_sessions_with_files(
+    codex_home: Path, records: dict[str, SessionRecord]
+) -> dict[str, SessionRecord]:
+    for path, archived in iter_rollout_files(codex_home):
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                first_line = handle.readline().strip()
+        except OSError:
+            continue
+        if not first_line:
+            continue
+        try:
+            first_obj = json.loads(first_line)
+        except json.JSONDecodeError:
+            continue
+        payload = first_obj.get("payload", {})
+        session_id = payload.get("id")
+        if not session_id:
+            continue
+        record = records.get(session_id)
+        if record is None:
+            record = SessionRecord(
+                session_id=session_id,
+                title=session_id,
+                updated_at=parse_iso_timestamp(payload.get("timestamp")),
+                created_at=parse_iso_timestamp(payload.get("timestamp")),
+                rollout_path=path,
+                cwd=payload.get("cwd", ""),
+                model_provider=payload.get("model_provider", ""),
+                archived=archived,
+            )
+            records[session_id] = record
+        else:
+            if not record.rollout_path.exists():
+                record.rollout_path = path
+            record.archived = record.archived or archived
+    return records
+
+
+def populate_last_message(record: SessionRecord) -> None:
+    last_role = ""
+    last_text = ""
+    try:
+        with record.rollout_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "response_item":
+                    continue
+                payload = obj.get("payload", {})
+                if payload.get("type") != "message":
+                    continue
+                role = payload.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                text = normalize_message_text(decode_text(payload.get("content", [])))
+                if not text:
+                    continue
+                last_role = role
+                last_text = sanitize_inline(text)
+    except OSError:
+        last_text = "[无法读取会话文件]"
+    record.last_role = last_role
+    record.last_text = last_text or "[无可显示文本]"
+
+
+def load_conversation(record: SessionRecord) -> list[tuple[str, str]]:
+    conversation: list[tuple[str, str]] = []
+    with record.rollout_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") != "response_item":
+                continue
+            payload = obj.get("payload", {})
+            if payload.get("type") != "message":
+                continue
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            text = normalize_message_text(decode_text(payload.get("content", [])))
+            if not text:
+                continue
+            conversation.append((role, text.strip()))
+    return conversation
+
+
+def load_all_sessions(codex_home: Path) -> list[SessionRecord]:
+    db_path = discover_sqlite_path(codex_home, "state")
+    records: dict[str, SessionRecord] = {}
+    if db_path and db_path.exists():
+        records = load_sessions_from_db(db_path)
+    records = merge_sessions_with_files(codex_home, records)
+    sessions = list(records.values())
+    for record in sessions:
+        populate_last_message(record)
+        if not record.title or record.title == record.session_id:
+            record.title = record.last_text[:60] or record.session_id
+    sessions.sort(key=lambda item: (item.updated_at, item.session_id), reverse=True)
+    return sessions
+
+
+def format_time(epoch_seconds: int) -> str:
+    if epoch_seconds <= 0:
+        return "-"
+    return datetime.fromtimestamp(epoch_seconds, tz=BEIJING_TZ).strftime(
+        "%Y-%m-%d %H:%M"
+    )
+
+
+def shorten(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text.ljust(width)
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + "…"
+
+
+def char_display_width(char: str) -> int:
+    return 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+
+
+def text_display_width(text: str) -> int:
+    return sum(char_display_width(char) for char in text)
+
+
+def fit_cell(text: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    clean_text = sanitize_inline(text)
+    current_width = text_display_width(clean_text)
+    if current_width <= width:
+        return clean_text + (" " * (width - current_width))
+
+    ellipsis = "…"
+    ellipsis_width = text_display_width(ellipsis)
+    if width <= ellipsis_width:
+        return ellipsis
+
+    target_width = width - ellipsis_width
+    parts: list[str] = []
+    used_width = 0
+    for char in clean_text:
+        char_width = char_display_width(char)
+        if used_width + char_width > target_width:
+            break
+        parts.append(char)
+        used_width += char_width
+    return "".join(parts) + ellipsis + (" " * (width - used_width - ellipsis_width))
+
+
+def compute_table_widths(total_width: int, separator_width: int) -> tuple[int, int, int, int]:
+    available = max(4, total_width - separator_width * 3)
+    minimums = [16, 18, 8, 12]
+    widths = minimums[:]
+    minimum_total = sum(minimums)
+
+    if available < minimum_total:
+        weights = minimums
+        widths = [max(1, available * weight // minimum_total) for weight in weights]
+        used = sum(widths)
+        index = len(widths) - 1
+        while used < available:
+            widths[index] += 1
+            used += 1
+            index = (index - 1) % len(widths)
+        while used > available:
+            if widths[index] > 1:
+                widths[index] -= 1
+                used -= 1
+            index = (index - 1) % len(widths)
+        return tuple(widths)
+
+    extra = available - minimum_total
+    id_extra = min(extra, 18)
+    widths[1] += id_extra
+    extra -= id_extra
+
+    title_extra = min(extra, 12)
+    widths[2] += title_extra
+    extra -= title_extra
+
+    widths[3] += extra
+    return tuple(widths)
+
+
+def render_table_row(
+    time_text: str,
+    session_id: str,
+    title: str,
+    last_text: str,
+    separator: str,
+    total_width: int,
+) -> str:
+    time_w, id_w, title_w, last_w = compute_table_widths(total_width, len(separator))
+    row = separator.join(
+        (
+            fit_cell(time_text, time_w),
+            fit_cell(session_id, id_w),
+            fit_cell(title, title_w),
+            fit_cell(last_text, last_w),
+        )
+    )
+    return row[:total_width]
+
+
+def build_table_cells(
+    time_text: str,
+    session_id: str,
+    title: str,
+    last_text: str,
+    separator: str,
+    total_width: int,
+) -> list[str]:
+    time_w, id_w, title_w, last_w = compute_table_widths(total_width, len(separator))
+    return [
+        fit_cell(time_text, time_w),
+        fit_cell(session_id, id_w),
+        fit_cell(title, title_w),
+        fit_cell(last_text, last_w),
+    ]
+
+
+def render_plain_table(sessions: list[SessionRecord]) -> str:
+    term_width = shutil.get_terminal_size((120, 30)).columns
+    header = render_table_row(
+        "北京时间",
+        "Session ID",
+        "标题",
+        "最后一句话",
+        "  ",
+        term_width,
+    )
+    lines = [header, "-" * term_width]
+    for session in sessions:
+        lines.append(
+            render_table_row(
+                format_time(session.updated_at),
+                session.session_id,
+                session.title,
+                session.last_preview,
+                "  ",
+                term_width,
+            )
+        )
+    return "\n".join(lines)
+
+
+def render_plain_conversation(record: SessionRecord) -> str:
+    lines = [
+        f"Session ID: {record.session_id}",
+        f"标题: {record.title}",
+        f"时间(北京时间): {format_time(record.updated_at)}",
+        f"CWD: {record.cwd or '-'}",
+        f"Provider: {record.model_provider or '-'}",
+        "",
+    ]
+    try:
+        conversation = load_conversation(record)
+    except OSError as exc:
+        lines.append(f"[读取失败] {exc}")
+        return "\n".join(lines)
+    for role, text in conversation:
+        label = ROLE_LABELS.get(role, role)
+        lines.append(f"[{label}]")
+        lines.append(text)
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+class SessionBrowser:
+    def __init__(self, sessions: list[SessionRecord]) -> None:
+        self.sessions = sessions
+        self.selected_index = 0
+        self.list_offset = 0
+        self.detail_offset = 0
+        self.mode = "list"
+        self.detail_lines: list[str] = []
+        self.resume_session_id: str | None = None
+
+    def run(self, stdscr: curses.window) -> None:
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(TIME_PAIR_ID, curses.COLOR_CYAN, -1)
+            curses.init_pair(ID_PAIR_ID, curses.COLOR_BLUE, -1)
+            curses.init_pair(TITLE_PAIR_ID, curses.COLOR_YELLOW, -1)
+            curses.init_pair(LAST_PAIR_ID, curses.COLOR_GREEN, -1)
+
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            if self.mode == "list":
+                self.draw_list(stdscr, height, width)
+            else:
+                self.draw_detail(stdscr, height, width)
+            stdscr.refresh()
+            key = stdscr.getch()
+            action = self.handle_key(key, height)
+            if action == "quit":
+                return
+            if action == "resume":
+                self.resume_session_id = self.current_session.session_id
+                return
+
+    def handle_key(self, key: int, height: int) -> str | None:
+        if self.mode == "list":
+            return self.handle_list_key(key, height)
+        return self.handle_detail_key(key, height)
+
+    def handle_list_key(self, key: int, height: int) -> str | None:
+        visible_rows = max(1, height - 4)
+        if key in (ord("q"), 27):
+            return "quit"
+        if key in (ord("e"), ord("E")):
+            return "resume"
+        if key in (curses.KEY_UP, ord("k")):
+            self.selected_index = max(0, self.selected_index - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.selected_index = min(len(self.sessions) - 1, self.selected_index + 1)
+        elif key == curses.KEY_NPAGE:
+            self.selected_index = min(
+                len(self.sessions) - 1, self.selected_index + visible_rows
+            )
+        elif key == curses.KEY_PPAGE:
+            self.selected_index = max(0, self.selected_index - visible_rows)
+        elif key == ord("g"):
+            self.selected_index = 0
+        elif key == ord("G"):
+            self.selected_index = max(0, len(self.sessions) - 1)
+        elif key in (10, 13, curses.KEY_ENTER):
+            self.open_detail()
+        self.keep_selection_visible(visible_rows)
+        return None
+
+    def handle_detail_key(self, key: int, height: int) -> str | None:
+        visible_rows = max(1, height - 3)
+        max_offset = max(0, len(self.detail_lines) - visible_rows)
+        if key in (ord("q"), ord("b"), 27):
+            self.mode = "list"
+            self.detail_offset = 0
+            return None
+        if key in (ord("e"), ord("E")):
+            return "resume"
+        if key in (curses.KEY_UP, ord("k")):
+            self.detail_offset = max(0, self.detail_offset - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            self.detail_offset = min(max_offset, self.detail_offset + 1)
+        elif key == curses.KEY_NPAGE:
+            self.detail_offset = min(max_offset, self.detail_offset + visible_rows)
+        elif key == curses.KEY_PPAGE:
+            self.detail_offset = max(0, self.detail_offset - visible_rows)
+        elif key == ord("g"):
+            self.detail_offset = 0
+        elif key == ord("G"):
+            self.detail_offset = max_offset
+        return None
+
+    def keep_selection_visible(self, visible_rows: int) -> None:
+        if self.selected_index < self.list_offset:
+            self.list_offset = self.selected_index
+        elif self.selected_index >= self.list_offset + visible_rows:
+            self.list_offset = self.selected_index - visible_rows + 1
+
+    @property
+    def current_session(self) -> SessionRecord:
+        return self.sessions[self.selected_index]
+
+    def open_detail(self) -> None:
+        record = self.sessions[self.selected_index]
+        lines = [
+            f"Session ID: {record.session_id}",
+            f"标题: {record.title}",
+            f"时间(北京时间): {format_time(record.updated_at)}",
+            f"Provider: {record.model_provider or '-'}",
+            f"CWD: {record.cwd or '-'}",
+            "",
+        ]
+        try:
+            conversation = load_conversation(record)
+        except OSError as exc:
+            conversation = []
+            lines.append(f"[读取失败] {exc}")
+        width = shutil.get_terminal_size((120, 30)).columns
+        wrap_width = max(20, width - 8)
+        for role, text in conversation:
+            label = ROLE_LABELS.get(role, role)
+            lines.append(f"[{label}]")
+            wrapped = textwrap.wrap(
+                text,
+                width=wrap_width,
+                replace_whitespace=False,
+                drop_whitespace=False,
+            )
+            lines.extend(wrapped or [""])
+            lines.append("")
+        if not conversation:
+            lines.append("[没有可显示的 user/assistant 对话]")
+        self.detail_lines = lines
+        self.detail_offset = 0
+        self.mode = "detail"
+
+    def draw_list(self, stdscr: curses.window, height: int, width: int) -> None:
+        stdscr.addnstr(
+            0,
+            0,
+            "Codex Sessions  ↑↓/j k 选择  Enter 查看  e 恢复  q 退出",
+            width - 1,
+            curses.A_BOLD,
+        )
+        self.draw_table_line(
+            stdscr,
+            1,
+            "北京时间",
+            "Session ID",
+            "标题",
+            "最后一句话",
+            selected=False,
+            header=True,
+            total_width=width - 1,
+        )
+
+        visible_rows = max(1, height - 4)
+        self.keep_selection_visible(visible_rows)
+        for row_index in range(visible_rows):
+            session_index = self.list_offset + row_index
+            if session_index >= len(self.sessions):
+                break
+            session = self.sessions[session_index]
+            self.draw_table_line(
+                stdscr,
+                2 + row_index,
+                format_time(session.updated_at),
+                session.session_id,
+                session.title,
+                session.last_preview,
+                selected=session_index == self.selected_index,
+                header=False,
+                total_width=width - 1,
+            )
+
+        footer = f"总数: {len(self.sessions)}"
+        stdscr.addnstr(height - 1, 0, footer, width - 1, curses.A_DIM)
+
+    def draw_table_line(
+        self,
+        stdscr: curses.window,
+        y: int,
+        time_text: str,
+        session_id: str,
+        title: str,
+        last_text: str,
+        *,
+        selected: bool,
+        header: bool,
+        total_width: int,
+    ) -> None:
+        separator = " "
+        cells = build_table_cells(
+            time_text,
+            session_id,
+            title,
+            last_text,
+            separator,
+            total_width,
+        )
+        if curses.has_colors():
+            pair_attrs = [
+                curses.color_pair(TIME_PAIR_ID),
+                curses.color_pair(ID_PAIR_ID),
+                curses.color_pair(TITLE_PAIR_ID),
+                curses.color_pair(LAST_PAIR_ID),
+            ]
+        else:
+            pair_attrs = [curses.A_NORMAL] * 4
+
+        base_attr = curses.A_BOLD if header else curses.A_NORMAL
+        if header:
+            base_attr |= curses.A_UNDERLINE
+        if selected:
+            base_attr |= curses.A_REVERSE | curses.A_BOLD
+
+        x = 0
+        for index, cell in enumerate(cells):
+            attr = base_attr | pair_attrs[index]
+            stdscr.addnstr(y, x, cell, total_width - x, attr)
+            x += text_display_width(cell)
+            if index < len(cells) - 1 and x < total_width:
+                stdscr.addnstr(y, x, separator, total_width - x, base_attr)
+                x += len(separator)
+
+    def draw_detail(self, stdscr: curses.window, height: int, width: int) -> None:
+        stdscr.addnstr(
+            0,
+            0,
+            "Session Detail  ↑↓/j k 滚动  e 恢复  q 返回",
+            width - 1,
+            curses.A_BOLD,
+        )
+        visible_rows = max(1, height - 2)
+        max_offset = max(0, len(self.detail_lines) - visible_rows)
+        self.detail_offset = min(self.detail_offset, max_offset)
+        for row_index in range(visible_rows):
+            line_index = self.detail_offset + row_index
+            if line_index >= len(self.detail_lines):
+                break
+            stdscr.addnstr(1 + row_index, 0, self.detail_lines[line_index], width - 1)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="codex-sessions",
+        description="查看本地 Codex 的全部 session 记录，不受 resume picker 过滤影响。",
+    )
+    parser.add_argument(
+        "--codex-home",
+        type=Path,
+        default=Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")),
+        help="Codex 数据目录，默认读取 ~/.codex",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="直接以纯文本表格输出全部 session",
+    )
+    parser.add_argument(
+        "--show",
+        metavar="SESSION_ID",
+        help="直接以纯文本输出某个 session 的精简对话",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    codex_home = args.codex_home.expanduser()
+    if not codex_home.exists():
+        print(f"Codex 目录不存在: {codex_home}", file=sys.stderr)
+        return 1
+
+    sessions = load_all_sessions(codex_home)
+    if not sessions:
+        print("没有找到任何 session。", file=sys.stderr)
+        return 1
+
+    if args.show:
+        session = next((item for item in sessions if item.session_id == args.show), None)
+        if session is None:
+            print(f"未找到 session: {args.show}", file=sys.stderr)
+            return 1
+        print(render_plain_conversation(session))
+        return 0
+
+    if args.list or not sys.stdout.isatty() or os.environ.get("TERM") == "dumb":
+        print(render_plain_table(sessions))
+        return 0
+
+    browser = SessionBrowser(sessions)
+    curses.wrapper(browser.run)
+    if browser.resume_session_id:
+        try:
+            os.execvp("codex", ["codex", "resume", browser.resume_session_id])
+        except OSError as exc:
+            print(f"执行 codex resume 失败: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
