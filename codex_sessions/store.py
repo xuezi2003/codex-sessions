@@ -400,7 +400,7 @@ def render_plain_conversation(record: SessionRecord) -> str:
     except OSError as exc:
         lines.append(f"[读取失败] {exc}")
         return "\n".join(lines)
-    for role, text in conversation:
+    for role, text in reversed(conversation):
         label = ROLE_LABELS.get(role, role)
         lines.append(f"[{label}]")
         lines.append(text)

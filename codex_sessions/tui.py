@@ -254,10 +254,12 @@ class SessionBrowser:
         if not conversation:
             return lines + [DetailLine("[没有可显示的 user/assistant 对话]", "meta")]
 
-        for index, (role, text) in enumerate(conversation, start=1):
+        total_messages = len(conversation)
+        for reverse_index, (role, text) in enumerate(reversed(conversation), start=1):
             style = "user" if role == "user" else "assistant"
             label = ROLE_LABELS.get(role, role)
-            lines.append(DetailLine(f"[{label} #{index:02d}]", style))
+            message_index = total_messages - reverse_index + 1
+            lines.append(DetailLine(f"[{label} #{message_index:02d}]", style))
             for body_line in build_detail_lines(text, max(1, width)):
                 lines.append(DetailLine(f"  {body_line}", "body"))
             lines.append(DetailLine("", "body"))
